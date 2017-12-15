@@ -7,15 +7,12 @@ const path = require("path");
 const most = require("most");
 const webpack = require("webpack");
 const SocketIOClient = require("socket.io-client");
-const InspectpackDaemon = require("inspectpack").daemon;
 
 const serializeError = require("../utils/error-serialization").serializeError;
 
 const DEFAULT_PORT = 9838;
 const DEFAULT_HOST = "127.0.0.1";
 const ONE_SECOND = 1000;
-const INSPECTPACK_PROBLEM_ACTIONS = ["versions", "duplicates"];
-const INSPECTPACK_PROBLEM_TYPE = "problems";
 
 const cacheFilename = path.resolve(os.homedir(), ".webpack-dashboard-cache.db");
 
@@ -56,16 +53,10 @@ class DashboardPlugin {
     if (!this.watching && this.socket) {
       this.handler = null;
       this.socket.close();
-      if (this.inspectpack) {
-        this.inspectpack.terminate();
-      }
     }
   }
 
   apply(compiler) {
-    // Lazily created so plugin can be configured without starting the daemon
-    this.inspectpack = InspectpackDaemon.create({ cacheFilename });
-
     let handler = this.handler;
     let timer;
 
@@ -197,17 +188,6 @@ class DashboardPlugin {
           value: stats.toString(statsOptions)
         }
       ]);
-
-      if (!this.minimal && nodeEnv !== "production") {
-        this.observeBundleMetrics(stats, this.inspectpack).subscribe({
-          next: message => handler([message]),
-          error: err => {
-            console.log("Error from inspectpack:", err); // eslint-disable-line no-console
-            this.cleanup();
-          },
-          complete: this.cleanup
-        });
-      }
     });
   }
 
@@ -255,97 +235,6 @@ class DashboardPlugin {
 
     // A null will be filtered out, disabling `versions` action.
     return null;
-  }
-
-  observeBundleMetrics(stats, inspectpack) {
-    const bundlesToObserve = Object.keys(stats.compilation.assets)
-      .filter(
-        bundlePath =>
-          // Don't include hot reload assets, they break everything
-          // and the updates are already included in the new assets
-          bundlePath.indexOf(".hot-update.") === -1 &&
-          // Don't parse sourcemaps!
-          path.extname(bundlePath) === ".js"
-      )
-      .map(bundlePath => ({
-        path: bundlePath,
-        context: stats.compilation.options.context,
-        source: stats.compilation.assets[bundlePath].source()
-      }));
-
-    const getSizes = bundles =>
-      Promise.all(
-        bundles.map(bundle =>
-          inspectpack
-            .sizes({
-              code: bundle.source,
-              format: "object",
-              minified: true,
-              gzip: true
-            })
-            .then(metrics => ({
-              path: bundle.path,
-              metrics
-            }))
-        )
-      )
-        .then(bundle => ({
-          type: "sizes",
-          value: bundle
-        }))
-        .catch(err => ({
-          type: "sizes",
-          error: true,
-          value: serializeError(err)
-        }));
-
-    const getProblems = bundles =>
-      Promise.all(
-        INSPECTPACK_PROBLEM_ACTIONS.map(action =>
-          Promise.all(
-            bundles
-              .map(bundle => {
-                // Root is only needed for versions and we hit disk to check it.
-                // So, only check on actual actions and bail out if not found.
-                let root;
-                if (action === "versions") {
-                  root = this.getProjectRoot(bundle);
-                  if (!root) {
-                    return null;
-                  }
-                }
-
-                return inspectpack[action]({
-                  code: bundle.source,
-                  root,
-                  duplicates: true,
-                  format: "object",
-                  minified: true,
-                  gzip: true
-                })
-                  .then(metrics => ({
-                    path: bundle.path,
-                    [action]: metrics
-                  }));
-              })
-              .filter(Boolean) // Filter out incorrect actions.
-          )
-        )
-      )
-        .then(bundle => ({
-          type: INSPECTPACK_PROBLEM_TYPE,
-          value: _.flatten(bundle)
-        }))
-        .catch(err => ({
-          type: INSPECTPACK_PROBLEM_TYPE,
-          error: true,
-          value: serializeError(err)
-        }));
-
-    const sizesStream = most.of(bundlesToObserve).map(getSizes);
-    const problemsStream = most.of(bundlesToObserve).map(getProblems);
-
-    return most.mergeArray([sizesStream, problemsStream]).chain(most.fromPromise);
   }
 }
 
